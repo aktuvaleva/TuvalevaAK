@@ -1,0 +1,692 @@
+---
+title: "Итоговый проект"
+author: "Анастасия Тувалева"
+output: 
+  html_document:
+    code_folding: hide
+---
+### Предобработка 
+
+Загрузка пакетов
+```{r message=FALSE, warning=FALSE}
+library(tidytext) 
+library(tidyr)
+library(stringr) 
+library(dplyr) 
+library(readr)
+library(LDAvis) 
+library(topicmodels)
+library(stopwords)
+library(ggplot2)
+library(recommenderlab)
+library(ggraph)
+library(igraph)
+```
+Важные переменные, которые не изменяются 
+```{r message=FALSE, warning=FALSE}
+load("~/shared/minor2_2022/data/project/metadata_g_10.RData")
+load("~/shared/minor2_2022/data/project/ratings_g_10.RData")
+tags = tags %>% rename(tag_id = id)
+nrc = get_sentiments(lexicon = "nrc")
+nrc = nrc %>% rename(tag = word)
+tag_survey_ans = survey_answers %>% 
+  left_join(tags)
+
+metadata_y = metadata %>% 
+  mutate(year = str_extract(title, "\\([0-9]+\\)"))
+metadata = metadata %>% 
+  select(item_id, title, directedBy, starring, avgRating, imdbId)
+metadata_y$year = str_replace_all(metadata_y$year, "[\\(\\)]", "")
+metadata_y$title = str_replace_all(metadata_y$title, "\\([0-9]+\\)", "")
+
+titles = data_frame(item_id = metadata_y$item_id, title = metadata_y$title)
+
+stop = data.frame(words=c(stopwords::stopwords("en")), stringsAsFactors=FALSE)
+```
+
+*Анализ тональности*
+
+Попробую проанализировать эмоциональную окраску (оценку, sentiment) тэгов. Для этого буду использовать словарь оценочной лексики nrc, каждому тэгу сопоставлен соответствующий сентимент.
+
+```{r message=FALSE, warning=FALSE}
+tag_sent = tag_survey_ans %>% 
+  filter(score >= 0)
+
+tag_sent = tag_sent %>% 
+  select(item_id, tag) %>% 
+  inner_join(nrc) %>% 
+  unique()
+
+tag_sent = tag_sent %>% 
+  left_join(titles) %>% 
+  select(-tag) %>% 
+  mutate(sentiment_sep = sentiment) %>% 
+  mutate(sentiment_v = 1)%>% 
+  unique() %>% 
+  select(-sentiment)
+
+tag_sent = tag_sent %>% pivot_wider(names_from = sentiment_sep, values_from = sentiment_v, values_fill = 0) 
+
+```
+Вывод: после очистки NA значений по выделенным сентиментам в датасете остается всего 133 фильма, что сильно сужает круг возможных рекомендаций основанных по этому параметру. Такое маленькое число фильмов с определенной тональностью можно обьяснить отсутствие тегов у многих фильмов или низкой уверенностью человека в поставленном теге (так как при определении тональности мы избавились от тех тегов, в которых пользователи не уверены). Однако можно попробовать вместо тегов использовать названия фильмов и по ним определять тональность: таким образом можно будет работать со всеми фильмами, а не только со 133 из них.
+
+*Анализ тональности по названиям*
+
+Для анализа тональности по названиям осуществим предварительную подготовку данных и их очистку (удалим числа и пунктуацию, приведем значения столбца, в котором указаны названия фильмов к нижнему регистру)
+```{r message=FALSE, warning=FALSE}
+titles_lem = titles %>% rename(text = title)
+titles_lem$text = str_replace_all(titles_lem$text, '[[:punct:]]+|[[:digit:]]+', ' ')
+titles_lem$text = str_to_lower(titles_lem$text)
+titles_lem$text = str_replace_all(titles_lem$text, '[[:space:]]+', ' ')
+titles_lem$text = str_replace_all(titles_lem$text, '\\s[a-zA-Z]{1}\\s', ' ')
+titles_lem$text = str_replace_all(titles_lem$text, '^[a-zA-Z]{1}\\s', '')
+titles_lem$text = str_replace_all(titles_lem$text, '\\s[a-zA-Z]{1}$', '')
+```
+
+```{r message=FALSE, warning=FALSE}
+titles_lem = titles_lem %>% 
+  mutate(title = metadata_y$title)
+
+titles.tidy = titles_lem %>%
+  select(title, item_id, text) %>% 
+  unnest_tokens(words, text) %>% 
+  anti_join(stop)
+
+nrc = nrc %>% rename(words = tag)
+
+titles_sent = titles.tidy %>% 
+  inner_join(nrc)%>% 
+  unique()
+
+titles_sent = titles_sent %>% 
+  left_join(titles) %>% 
+  mutate(sentiment_sep = sentiment) %>% 
+  mutate(sentiment_v = 1)
+
+titles_sent = titles_sent %>% 
+  unique() %>% 
+  select(-sentiment, -words, -item_id)%>% 
+  unique()
+
+titles_sent = titles_sent %>% pivot_wider(names_from = sentiment_sep, values_from = sentiment_v, values_fill = 0) 
+
+
+```
+При помощи анализа тональности по названиям получила разделение 207 фильмов по 10 сантиментам. Этот резульатат можно использовать для построения рекомендаций, так как часто выделенная тональность названия будет соответствовать настроению фильма, за которое в свою очередь часто отвечает жанр. 
+
+*Разделение по тематикам названий фильмов при помощи LDA*
+
+```{r message=FALSE, warning=FALSE}
+titles_counts <- titles.tidy %>%
+  anti_join(stop_words, by=c("words"="word")) %>%
+  count(title, words, sort = TRUE) %>%
+  ungroup()
+```
+
+```{r message=FALSE, warning=FALSE}
+titles_dtm <- titles_counts %>%
+  cast_dtm(title, words, n)
+
+title4_lda <- LDA(titles_dtm, k = 8, control = list(seed = 12345))
+
+
+
+title4_topics <- tidy(title4_lda, matrix = "beta")
+
+
+title5_topics = title4_topics %>% 
+  rename(words = term) %>%
+  pivot_wider(names_from = topic, values_from = beta, values_fill = 0)
+
+topic_title = titles_counts %>% 
+  left_join(title5_topics) %>% 
+  select(-n, -words)%>%
+  group_by(title) %>%
+  summarise_each(list(sum))
+
+
+title8_top_terms = title4_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+title8_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+```
+
+При помощи алгоритма LDA удалось разбить фильмы на 8 тематик по названием. Как видно из графика по самым часто встречающимся словам по каждой теме, можно заметить, что тематическое разделение довольно неплохо отражает различные жанры. Следовательно, этот результат можно использовать в content-based рекомендательной системе и рекомендовать фильмы пользователю по выделенной теме.
+
+
+*Разделение тегов по темам при помощи LDA*
+```{r message=FALSE, warning=FALSE}
+info = inner_join(tag_survey_ans, metadata)%>%
+  filter(score >= 4) %>% 
+  select (-imdbId) %>% 
+  select(-user_id, -tag_id, -score)
+```
+
+```{r message=FALSE, warning=FALSE}
+tag.tidy = info %>%
+  select(title, item_id, tag) %>% 
+  unnest_tokens(words, tag) %>% 
+  anti_join(stop)
+
+tag_counts = tag.tidy %>%
+  anti_join(stop_words, by=c("words"="word")) %>%
+  count(title, words, sort = TRUE) %>%
+  ungroup()
+
+tag_dtm = tag_counts %>%
+  cast_dtm(title, words, n)
+
+tag6_lda = LDA(tag_dtm, k = 6, control = list(seed = 12345))
+
+tag6_topics = tidy(tag6_lda, matrix = "beta")
+
+
+tag6_top_terms = tag6_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+tag6_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+```
+Как можно заметить из графика разделение по тегам не так хорошо отражает разницу в жанрах: в одной теме часто сочетаются несовместимые слова по смыслу в контексте жанров (например, lawyers, romance и sports - эти слова, хотя и находятся в одной теме, отражают совершенно различные виды кино). Это может быть связано с тем, что тег не является полноценным текстом, это чаще всего одно слово, по которому сложно определить тематику. Поэтому было решено отказаться от этой идеи в пользу выделения жанров по названиям.
+
+
+### Коллаборативная фильтрация
+
+```{r message=FALSE, warning=FALSE}
+realMatrix_fromdf = function(data){
+  ratings = data %>% 
+    select(user_id, item_id, rating)
+  ratings = ratings %>% arrange(item_id)
+  rates = pivot_wider(ratings, names_from = item_id, values_from = rating)
+  userNames = rates$user_id
+  rates = select(rates, -user_id)
+  rates = as.matrix(rates)
+  rownames(rates) = userNames
+  r = as(rates, "realRatingMatrix")
+  r
+}
+
+Names_ext = function(data){
+  ratings = data %>% 
+    select(user_id, item_id, rating)
+  ratings = ratings %>% arrange(item_id)
+  rates = pivot_wider(ratings, names_from = item_id, values_from = rating)
+  userNames = rates$user_id
+  userNames
+}
+```
+У меня получилась большая матрица с 35974 оценками. 
+
+Используя полученную матрицу уже можно работать с фильтрацией и самими рекомендационными системами. Но для начала необходимо немного отфильтровать данные. Нет смысла использовать фильмы, оценок у которых слишком мало, тогда нет достаточно данных для того, чтобы рекомендовать этот фильм. 
+
+```{r message=FALSE, warning=FALSE}
+r = realMatrix_fromdf(ratings)
+ggplot(data = data.frame(filmRate=colCounts(r))) + geom_histogram(aes(x=filmRate)) #otsenky filma
+ggplot(data = data.frame(userRate=rowCounts(r))) + geom_histogram(aes(x=userRate)) #otsenky odnogo usera
+```
+Возьмем количество 20 - как минимальное количество оценок для фильма и 5 - для оценок от пользователей. 
+Если посмотреть на графики, можно увидеть, что большинство пользователей оценили меньше 10 фильмов, но при этом каждый оценил хотя бы несколько фильмов. Если говорить про фильмы, то больше всего фильмов с 50-ю оценками, и в целом больше фильмов с менее чем 100 оценок, но и фильмов совсем без оценок нет. Интерационно выбрала 20 как минимальную величину для оценок фильмов и 5 как минимальное количество оценок для пользователя. Так мы отсекаем совсем непопулярные фильмы и наименее активных пользователей.
+```{r message=FALSE, warning=FALSE}
+ratings_movies <- r[rowCounts(r) > 5, colCounts(r) > 20 ]
+```
+```{r message=FALSE, warning=FALSE}
+set.seed(100)
+eval_sets <- evaluationScheme(data = ratings_movies, 
+                              method = "split",
+                              train = 0.8, 
+                              given = 15, 
+                              goodRating = 4) 
+recc_model_UBCF <- Recommender(data = getData(eval_sets, "train"), method = "UBCF")
+   
+recc_predicted_UBCF <-
+  predict(
+    object = recc_model_UBCF,
+    newdata = getData(eval_sets, "known"),
+    n = 6,
+    type = "ratings"
+  )
+```
+```{r message=FALSE, warning=FALSE}
+
+recc_model_IBCF <- Recommender(data = getData(eval_sets, "train"), method = "IBCF")
+   
+recc_predicted_IBCF <-
+  predict(
+    object = recc_model_IBCF,
+    newdata = getData(eval_sets, "known"),
+    n = 6,
+    type = "ratings"
+  )
+
+
+```
+
+```{r message=FALSE, warning=FALSE}
+getFilms_0 = function(userId, data){
+  user = data %>% filter(user_id == userId)
+  
+  if (nrow(user)==0) {
+    recommend = c("The Shawshank Redemption", "The Godfather", "The Dark Knight", "The Godfather Part II", "12 Angry Men")
+  } else {
+    r = realMatrix_fromdf(data)
+    ratings_movies <- r[rowCounts(r) > 5, colCounts(r) > 20 ]
+    userNames = Names_ext(data)
+    number = which(userNames == userId)
+    
+    recc_predicted <- predict(object = recc_model_UBCF, newdata = ratings_movies, n = 6)
+    recc_user <- recc_predicted@items[[number]]
+    movies_user <- recc_predicted@itemLabels[recc_user]
+    recommend <- metadata$title[match(movies_user, metadata$item_id)]
+  }
+  recommend
+}  
+
+
+```
+Посмотрим работу системы на примере одного случайного пользователя.
+```{r}
+recc_modelUBCF <- Recommender(data = getData(eval_sets, "train"), method = "UBCF")
+
+model_detailsUBCF <- getModel(recc_modelUBCF)
+recc_predictedUBCF <- predict(object = recc_modelUBCF, newdata = getData(eval_sets, "train"), n = 6)
+
+reccUBCF_user_1 <- recc_predictedUBCF@items[[1]]
+
+movies_user_1 <- recc_predictedUBCF@itemLabels[reccUBCF_user_1]
+
+names_movies_user_1 <- metadata$title[match(movies_user_1, metadata$item_id)]
+names_movies_user_1
+```
+А теперь посмотрим на пользователя "675281"
+
+Данный пользователь оценил 28 фильмов. Его оценки фильмов варьировались от 0.5 до 5. Средняя оценка фильмов 2.69, наивысшую оценку (5) он поставил следующим фильмам:
+Juno (2007) Jason Reitman - Ellen Page, Michael Cera, Jennifer Garner, Jason Bateman (средний рейтинг 3.72332)
+Kick-Ass (2010) Matthew Vaughn - Aaron Johnson, Nicolas Cage, Clark Duke, Evan Peters (средний рейтинг 3.60188)
+Clerks II (2006) Kevin Smith - Jeff Anderson, Brian O'Halloran, Rosario Dawson (средний рецтинг 3.50947)
+```{r}
+reccUBCF_user_1 <- recc_predictedUBCF@items[["675281"]]
+movies_user <- recc_predictedUBCF@itemLabels[reccUBCF_user_1]
+names_movies_user <- metadata$title[match(movies_user, metadata$item_id)]
+names_movies_user <- metadata$title[match(movies_user, metadata$item_id)]
+names_movies_user_1
+```
+
+Если посмотреть на результат, все фильмы с похожим рейтингом.
+
+**Оценивание рекомендации:** 
+```{r message=FALSE, warning=FALSE}
+eval_accuracy_UBCF <- calcPredictionAccuracy(
+      x = recc_predicted_UBCF,
+      data = getData(eval_sets, "unknown"),
+      byUser = F) 
+
+eval_accuracy_UBCF
+```
+```{r message=FALSE, warning=FALSE}
+eval_accuracy_IBCF <- calcPredictionAccuracy(
+      x = recc_predicted_IBCF,
+      data = getData(eval_sets, "unknown"),
+      byUser = F) 
+
+eval_accuracy_IBCF
+```
+По полученной формальной оценке усредненной по всем пользователям точность модели построенной методом UBCF выше, чем методом IBCF, так как значения ошибок ниже (RMSE, MSE или MAE). Поэтому я решила использовать ее и строить функцию именно по UBCF рекомендательной системе.
+
+**1. Новый пользователь, которого нет в базе данных.**
+
+```{r message=FALSE, warning=FALSE}
+getFilms_0("4", ratings)
+```
+Вывод: Рекомендуется топ-5 фильмов с сайта IMBD, как и предполагалось при построении системы.   
+
+**2. Пользователь, который оценивает фильмы низко.**
+
+```{r message=FALSE, warning=FALSE}
+find_user_low = ratings %>% 
+  group_by(user_id) %>% 
+  summarise(mean_est = mean(rating)) %>% 
+  arrange()
+find_user_low %>% head(1)
+```
+У пользователя с id 134 самая низкая средняя оценка, следовательно, можно протестировать систему на нем.
+```{r message=FALSE, warning=FALSE}
+getFilms_0("134", ratings)
+```
+Теперь необходимо сравнить по характеристикам оцененные пользователем фильмы и те, что выдала система
+Найдем оцененные пользователем фильмы:
+```{r message=FALSE, warning=FALSE}
+films134 = ratings %>% filter(user_id == "134")
+metadata %>% 
+  inner_join(films134)
+```
+Проанализировав фильмы, которые пользователь уже смотрел невозможно сделать вывод о том, что является причиной низкого рейтинга: ведь жанры, сюжеты, актерский состав и настроение фильмов совершенно разное. Поэтому оценивая работу моей рекомендательной системы, до применения функции я ожидала получить разносортные рекомендации, чтобы покрыть всевозможные вкусы и предпочтения.
+  
+Вывод: Collaborative filtering система отлично показала себя для такого сценария, так как она предложила 6 фильмов совершенно разных жанров и сюжетов ("Punch-Drunk Love (2002)"(романтика, комедия), "Into the Wild (2007)"(приключения, драма), "The Hateful Eight (2015)"(вестерн, триллер), "Departed, The (2006)"(триллер, криминал), "Guardians of the Galaxy (2014)"(экшн, комедия, супергерои), "Matchstick Men (2003)"(комедия, драма)).
+
+### Content-based рекомендация
+
+Для начала выполню предобработку данных: создам переменную mean_rating через оценки пользователей, объединю с основным датасетом, уберу переменные, которые не буду учитывать при построении рекомендательной системы, например, год выхода фильма и режиссера.
+```{r message=FALSE, warning=FALSE}
+ratings_mean = ratings %>% group_by(item_id) %>% summarise(mean_rating = mean(rating)) 
+
+metadata = left_join(ratings_mean, metadata, by= 'item_id')
+metadata = metadata %>% select( -imdbId, -directedBy)
+```
+
+Дальнейший код посвящен построению модели LDA, которая поможет разбить фильмы, в зависимости от их названий, на определенные темы, которые в дальнейшем будут трактоваться как жанры.
+
+Мне кажется, что использование таких "самодельных" жанров необходимо, потому что, к сожалению, нет альтернатиных вариантов, откуда эти жанры можно взять. Данная характеристика очень важна в CB-системе, потому что зачастую пользователи хотят видеть какой-то определенный сюжет, настроение фильма. Все эти характеристики, как раз, и заложены в жанры. 
+
+Стоит также отметить, что разделение названий фильмов по темам получилось достаточно неплохим, поэтому рекомендации, которые будут выдаваться с учетом этого критерия, будут более точными, чем в случае, если мы этот критерий использовать не будем.
+
+Еще одной из основных переменных, выбранных мной для построения content-based рекомендательной системы, является наличие определенного актера в фильме. Я предполагаю, что актерский состав может являться основной метрикой при выборе пользователем фильма, поэтому дальнейший код делает в каждой строке по одному актеру, а потом превращает строки с именем актера в одноименные столбцы. 
+
+Стоит отметить, что на данном этапе оставлены только 15 актеров, которые встречаются в фильмах из выборки наиболее часто. Основной целью данного действия является уменьшение количества столбцов, посвященных актерам, чтобы уменьшить их значимость при построении рекомендаций.
+
+```{r message=FALSE, warning=FALSE}
+new_info = metadata %>% unnest_tokens(actor, starring, token = stringr::str_split, pattern = ", ") 
+new_info = new_info %>% filter(actor != "")
+actors = new_info %>%
+  group_by(actor) %>%
+  summarise(count = n()) %>%
+  top_n(15,)   
+```
+
+На этом этапе я заполнила строки единицами и нулямию. 1 ставится, если в фильме актер присутствует. 0 -- в противном случае.
+```{r message=FALSE, warning=FALSE}
+new_info = new_info %>% mutate(star_v = 1)
+future_matrics= new_info %>% pivot_wider(names_from = actor, values_from = star_v, values_fill = 0) 
+data = future_matrics %>%
+  select(item_id, title, avgRating, mean_rating, actors$actor)
+topic_title_1 = topic_title %>% 
+  left_join(metadata_y) %>% 
+  select(item_id, "1", "2", "3", "4", "5", "6", "7", "8")
+data = inner_join(data, topic_title_1)
+```
+
+```{r message=FALSE, warning=FALSE}
+data = data %>% dplyr::select(-title)
+```
+
+```{r message=FALSE, warning=FALSE}
+rownames = data$item_id
+data = data %>% dplyr::select(-item_id)
+rownames(data) = rownames 
+```
+
+
+Остается самое интересное -- построение матрицы схожести. 
+Я выбрала следующие переменные:
+
+1. актерский состав (имеет наибольший вес), 
+2. вероятность принадлежности фильма к определенной теме, посчитанная с помощью LDA (вторая по значимости переменная)
+3. рейтинги фильмов на основе оценок пользователей
+4. рейтинги фильмов на imdb. 
+
+Не были использованы такие переменные как режиссеры и год выхода фильма, так как, во-первых, по моему мнению, пользователь чаще всего при выборе фильма не обращает внимание на режиссера, во-вторых, каждый режиссер снимает фильмы преимущественно в похожих жанрах, а мы это уже учли. Год выпуска фильма безусловно влияет на сюжет и технические возможности фильма, однако, в сравнении с другими переменными, важность и значимость данной переменной была бы крайне мала, поэтому было принято решение не учитывать ее в рекомендательной системе.
+
+```{r message=FALSE, warning=FALSE}
+sim = lsa::cosine(t(as.matrix(data)))
+diag(sim) = 0 
+```
+
+Для того, чтобы прописать сценарии в функции, потребуется универсальный список фильмов с наиболее высокими средними оценками. Создадим датафрейм, состоящий из 15 таких фильмов. 
+```{r message=FALSE, warning=FALSE}
+list_max = metadata %>%
+  mutate(rating_mean = (mean_rating + avgRating)/2) %>%
+  arrange(desc(rating_mean)) %>%
+  top_n(10, rating_mean) %>%
+  select(title, item_id, mean_rating, avgRating)
+
+```
+**Построение кода с функцией**. 
+
+Функция работает одновременно для трех сценариев: 
+
+1. Если пользователь есть в системе и у него есть фильмы, оцененные на 4 и выше (оценка 4 взята именно потому, что оценки ниже в обычной жизни трактуются как отрицательные, в то время как сама 4 ставится пользователями преимущественно при положительной оценке фильма, но при наличие каких-либо несущественных недостатков).
+
+2. Если пользователь есть в системе, но он не ставил оценок выше тройки. В таком случае выдается список из 15 фильмов, обладающих наивысшей средней оценкой в нашей системе (учитывается и рейтинг на imdb, и среднее значение из наших датафреймов) без учета фильмов из этого списка, которые пользователь оценил плохо (если такие есть).
+
+3. Если пользователя вообще нет в системе. Тогда ему выдается список фильмов, обладающих наивысшим рейтингом в системе (учитывается и рейтинг на imdb, и среднее значение оценок из наших датафреймов).
+
+```{r message=FALSE, warning=FALSE}
+getFilms = function(user_Id){
+  user = ratings %>% filter(user_id == user_Id & rating >= 4) 
+  
+  if (nrow(user)==0)  { 
+    user = ratings %>% filter(user_id == user_Id ) 
+    if (nrow(user)==0) {
+      recommend = list_max$title} 
+    else { 
+      recommend = list_max %>% filter (!(item_id %in% user$item_id)) } 
+  } else {
+    mostSimilar = head(sort(sim[,as.character(user$item_id)], decreasing = T), n = 10)
+    a = which(sim[,as.character(user$item_id)] %in% mostSimilar, arr.ind = TRUE)
+    index = arrayInd(a, .dim = dim(sim[,as.character(user$item_id)]))
+    result = rownames(sim)[index[,1]]
+    recommend = filter(metadata,item_id %in% result) %>% dplyr::select(title) 
+  }
+  recommend
+}
+```
+
+
+### Примеры content-based
+
+Проверим работу всех трех сценариев:
+
+**1. Пользователь есть в системе и у него есть фильмы, оцененные на 4 и выше.**
+
+Данному пользователю изначально понравились такие фильмы, как:
+
+Фильмы:                             | Жанры:
+----------------------------------- | -----------------------------------------------------------
+"Serenity"                          | фантастика, боевик, триллер, приключения, связан с космосом
+"Lord of the Rings: The Two Towers" | фэнтези, приключения, драма, боевик 
+"Snatch"                            | преступление, комедия, боевик
+"Lucky Number Slevin"               | триллер, драма, преступление
+
+На примере данного пользователя я хотела еще продемонстрировать и то, что наша CB-система рекомендует пользователям, которым понравились фильмы в разных жанрах.
+
+```{r message=FALSE, warning=FALSE}
+getFilms(999465)
+```
+
+Ниже представлены жанры рекомендованных системой фильмов:
+
+Фильмы:                       | Жанры:
+----------------------------- | -------------------------------------------------------
+We're the Millers             | комедия, преступление
+Watchmen и X-Men: First Class | фантастика, боевик 
+Paul                          | фантастика, комедия, преступления, связанные с космосом
+Enchanted                     | комедия и фэнтези
+Despicable me                 | комедия, преступление, приключение, фантастика
+
+Я рассмотрела лишь часть рекомендаций, однако уже можно заметить, что их жанры преимущественно совпадают и очень похожи на те, которые понравились пользователю, как и ожидалось при построении рекомендательной системы.
+
+**2. Пользователь, которого нет в системе**
+
+Рассмотрим пример, в котором у нас есть пользователь, незарегистрированный в системе.
+
+```{r message=FALSE, warning=FALSE}
+getFilms(155)
+```
+Как и было запланировано, пользователю порекомендовались фильмы с наиболее высоким средним рейтингом.
+
+**3. Пользователь, который ставил только негативные оценки (максимальная оценка - 3,5).**
+
+Попробю порекомендовать фильмы для "сложного" пользователя, который не оценил ни один фильм на высокую оценку (в нашей системе - от 4).
+
+```{r message=FALSE, warning=FALSE}
+getFilms(993868)
+```
+
+Пользователю были рекомендованы все фильмы из топа, так как до этого он не оценивал фильмы с высоким рейтингом в нашей системе. Вывод топа в таком случае соответствует алгоритму рекомендаций нашей системы.
+
+**4. Пользователь, который поставил высокие оценки небольшому количеству фильмов**
+
+Теперь рассмотрим пользователя, которому понравилось несколько фильмов, но не очень много.
+```{r message=FALSE, warning=FALSE}
+user = ratings %>% filter(user_id == 331212 & rating >= 4 )
+metadata %>% filter(item_id %in% user$item_id) %>% select(title, item_id)
+```
+
+Ниже я прописала жанры для каждого из любимых фильмов пользователя, чтобы впоследствии оценить качество рекомендации:
+
+Фильмы:               | Жанры:
+--------------------- | ---------------------------------------
+Seven (a.k.a. Se7en)  | Crime · Drama · Mystery · Thriller
+Ice Age               | Animation · Adventure · Comedy · Family
+
+Теперь выведу для него список рекомендованных фильмов:
+
+```{r message=FALSE, warning=FALSE}
+getFilms(331212)
+```
+
+Фильмы:                              | Жанры:
+------------------------------------ | ----------------------------------------------------
+Outbreak                             | Action · Drama · Thriller
+Demolition Man	                     | Action · Sci-Fi · Thriller
+Dances with Wolves	                 | Adventure · Drama · Western
+Mars Attacks!	                       | Comedy · Sci-Fi
+Deep Impact	                         | Action · Drama · Sci-Fi · Thriller
+Dick Tracy	                         | Action · Comedy · Crime · Music · Romance · Thriller
+School of Rock	                     | Comedy · Music
+Anchorman: The Legend of Ron Burgundy| Comedy
+Gone Baby Gone	                     | Crime · Drama · Mystery · Thriller
+Kung Fu Panda                        | Kids & family · Comedy · Adventure · Animation
+
+Замечу, что рекомендованные фильмы соответствуют жанрам, которые изначально нравились пользователю.
+
+### Сценарий
+
+**Порекомендуйте что-нибудь человеку, который любит позитивные фильмы с тегом sci fi.**
+
+Отберу фильмы с тегом "sci fi". Для этого сделаю одну таблицу со всеми называниями фильмов, их ID и тегами.
+```{r message=FALSE, warning=FALSE}
+human_ratings_mean = ratings %>%
+  group_by(item_id) %>%
+  summarise(mean_rate = mean(rating))
+data_scenario = left_join(metadata, human_ratings_mean, by = "item_id")
+names(tags)[2] = "tag_id"
+survey_plus_tags = left_join(survey_answers, tags, by="tag_id")
+survey_films = survey_plus_tags %>%
+  group_by(item_id) %>%
+  summarise(tags = paste(tag,collapse = ', '))
+data_scenario = left_join(data_scenario, survey_films, by = "item_id")
+data_scenario = data_scenario %>% select(item_id, title, tags)
+```
+
+Отфильтрую только те фильмы, в которых встречается тег "sci fi" или "sci-fi".
+
+```{r message=FALSE, warning=FALSE}
+sci_fi = data_scenario %>%
+  unnest_tokens(tag, tags, token = stringr::str_split, pattern = ", ") %>%
+  filter(tag == "sci fi" | tag == "sci-fi")
+sci_fi
+```
+
+Найду пользователей, которые хорошо (>= 4.0) оценили такие фильмы и смотрели наибольшее количество из них.
+
+```{r message=FALSE, warning=FALSE}
+users_scifi = sci_fi %>%
+  left_join(ratings, by = "item_id") %>%
+  filter(rating >= 4) %>%
+  group_by(user_id) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n)) %>%
+  top_n(3,)
+users_scifi
+```
+После проверки фильмов, просмотренных данными пользователями, я остановилась на пользователе с user_id = 397121. Мне показалось, что его/ее подборка фильмов наиболее жизнеутверждающая.
+
+Ниже приведен список фильмов (с жанрами, для последующего сравнения) пользователя 397121, которые он оценил на 4.0 и выше.
+
+```{r message=FALSE, warning=FALSE}
+user_check = ratings %>%
+  filter(user_id == 397121 & rating >= 4)
+films_scifi = filter(data_scenario, data_scenario$item_id %in% user_check$item_id)
+films_scifi
+```
+
+Фильмы:                              | Жанры:
+------------------------------------ | -------------------------------------------------------
+Twelve Monkeys (a.k.a. 12 Monkeys)   | Mystery · Sci-Fi · Thriller
+Outbreak                             | Action · Drama · Thriller
+Mission: Impossible                  | Action · Adventure · Thriller
+Ghost in the Shell (Kôkaku kidôtai)  | Animation · Crime · Drama · Mystery · Sci-Fi · Thriller
+Basic Instinct                       | Drama · Mystery · Thriller
+Liar Liar 	                         | Comedy · Fantasy
+Armageddon                           | Action · Adventure · Sci-Fi · Thriller
+Matrix, The                          | Action · Sci-Fi
+Scent of a Woman                     | Biography · Crime · Drama · History
+Charlie's Angels                     | Action · Adventure · Comedy · Crime · Thriller
+
+**Рекомендация CF**
+
+```{r message=FALSE, warning=FALSE}
+getFilms_0(397121, ratings)
+```
+
+Фильмы:                        | Жанры:
+------------------------------ | -----------------------------------
+Departed                       | Crime · Drama · Thriller  
+Three Colors: Red              | Drama · Mystery · Romance.
+Barton Fink                    | Comedy · Drama · Thriller         
+Hoop Dreams                    | Documentary · Drama · Sport           
+Dawn of the Planet of the Apes | Action · Adventure · Drama · Sci-Fi · Thriller       
+Incredibles                    | Animation · Action · Adventure · Family
+
+**Рекомендация CB**
+
+```{r message=FALSE, warning=FALSE}
+getFilms(397121)
+```
+
+Фильмы:             | Жанры:
+------------------- | -----------------------------------
+Boomerang				    | Comedy · Drama · Romance
+Tommy Boy 				  | Adventure · Comedy
+Dances with Wolves  |	Adventure · Drama · Western.	
+Basic Instinct 		  |	Drama · Mystery · Thriller
+Liar Liar 				  | Comedy · Fantasy
+Grosse Pointe Blank | Action · Comedy · Crime · Romance · Thriller	
+Inconvenient Truth  |	Documentary · News		
+Amazing Spider-Man  | Action · Adventure · Sci-Fi
+
+Рекомендации двух моих систем разные, однако они обе достаточно точные, если мы ориентируемся на жанры рекомендованных фильмов.
+
+### Общие выводы 
+
+Благодаря проделанной работе, мне удалось построить две довольно точные рекомендательные системы при помощи методов: collaborative filtering и content based, а также оценить их на конкретных примерах пользователей.
+
+Collaborative filtering:
+1. В датасете, по которому была построена модель, я оставила пользователей, которые поставили минимум 5 оценок фильмов и фильмы, которые получили от 20ти оценок от пользователей.
+2. Использовались IBCF и UBCF методы для получения рекомендаций. Результаты оценки показали, что модель, основанная на UBCF, имела меньшие ошибки прогнозирования, что указывает на лучшую производительность (показатели RMSE 1.14 IBCF vs 1.06 UBCF, MSE 1.3 IBCF vs 1.13 UBCF, MAE 0.87 vs 0.807 UBCF). Было принято решение остановиться на user based методе, который я оценила с помощью небольшого примера.
+3. Рекомендательная система была протестирована на различных сценариях, которые включают новых пользователей, пользователей из базы, и пользователей, которые низко оценивали фильмы. Результаты показали, что система выдает фильмы, которые действительно подходят пользователю. Система учитывает рейтинг фильмов и советует те фильмы, рейтинг которых либо достаточно высокий.Для пользователей, которых нет в базе было решено рекомендовать топ 5 фильмов с сайта IMBD.
+4. В целом способность системы предлагать разнообразные рекомендации способствует повышению удобства просмотра фильмов пользователями с различными предпочтениями и вкусами.
+
+Content-based:
+1. Content-based рекомендательная система была построена на основе следующих переменных : вероятность принадлежности фильма к той или иной теме, полученная с помощью LDA, наличие определенных актеров в фильмах, средние оценки на imbdb и в моей базе.
+2. На вход content-based система принимает id пользователя и на основе его предпочтений рекомендует 10 фильмов.
+3. Были учтены 3 сценария развития событий: если пользователь имеет фильмы с высокими оценками (4 и выше); если пользователь есть в системе, но не имеет высоких оценок; если пользователя нет в системе.
+4. Проверенные примеры прошли, по моему мнению, проверку на адекватность.
+
+В перспективе можно было бы доработать content-based систему, добавив туда дополнительные характеристики, такие как жанр или описание фильма. Например, это можно сделать путем парсинга сайта imbd.
